@@ -28,6 +28,9 @@ pub struct PrepareRequest {
     /// A boot ROM file the user chose; otherwise one is reused or downloaded when the board needs it.
     pub bootrom: Option<PathBuf>,
     pub name: Option<String>,
+    /// Prepare it jailbroken (firmwarekit's `--jailbreak`): afc2 and Cydia, from iPhone OS 2.0 on.
+    #[serde(default)]
+    pub jailbreak: bool,
 }
 
 /// Whether this build can prepare devices, and why not.
@@ -126,6 +129,12 @@ pub(crate) fn run(ctx: PrepareContext, request: PrepareRequest, reporter: &Repor
     let catalog = Catalog::get();
     let firmware = catalog.find(&request.firmware_id).ok_or("That iOS version isn't in the catalog")?.clone();
     availability(&ctx.resources)?;
+    if request.jailbreak && !firmware.offers_jailbreak() {
+        return Err(format!(
+            "iOS {} can't be prepared jailbroken: the jailbreak needs iPhone OS 2.0 or later.",
+            firmware.label()
+        ));
+    }
     let _note = PendingNote::write(&ctx.dirs, &request);
     let started = Instant::now();
     let mut timings: Vec<(String, f64)> = Vec::new();
@@ -244,6 +253,7 @@ pub(crate) fn run(ctx: PrepareContext, request: PrepareRequest, reporter: &Repor
         &out,
         &cache,
         &catalog_file,
+        request.jailbreak,
         reporter,
         &mut timings,
     );
@@ -311,6 +321,7 @@ fn run_firmwarekit(
     out: &Path,
     cache: &Path,
     catalog: &Path,
+    jailbreak: bool,
     reporter: &Reporter,
     timings: &mut Vec<(String, f64)>,
 ) -> Result<(), String> {
@@ -338,6 +349,10 @@ fn run_firmwarekit(
     }
     if let Some(sibling) = sibling {
         command.arg("--sibling-ipsw").arg(sibling);
+    }
+    // firmwarekit fetches Cydia's bootstrap into Jailbreak/ beside `cache`, so it outlives `cache`, which run removes.
+    if jailbreak {
+        command.arg("--jailbreak");
     }
     // firmwarekit boots the engine for its one-shots itself (`firmwarekit oneshot`, this engine library).
     command.env("LTM_QEMU_DYLIB", &engine).env("TMPDIR", ctx.dirs.cache());

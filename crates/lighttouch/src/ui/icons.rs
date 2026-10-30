@@ -21,6 +21,7 @@ pub const VOLUME_DOWN: &str = "\u{E44C}";
 pub const DOWNLOAD: &str = "\u{E20C}";
 pub const TRASH: &str = "\u{E4A6}";
 pub const PENCIL: &str = "\u{E3B4}";
+pub const LOCK_OPEN: &str = "\u{E306}";
 pub const CHART: &str = "\u{E154}";
 pub const RECOVER: &str = "\u{E038}";
 pub const INFO: &str = "\u{E2CE}";

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! lighttouch list
-//! lighttouch prepare <firmware id> [--ipsw FILE] [--rom FILE] [--name NAME]
+//! lighttouch prepare <firmware id> [--ipsw FILE] [--rom FILE] [--name NAME] [--jailbreak]
 //! lighttouch run <record id> [--seconds N] [--recover] [--shot FILE.ppm] [--script FILE]
 //!                [--network direct|archive[:yyyyMMdd]] [--lan] [--no-headphones]
 //! ```
@@ -242,6 +242,7 @@ fn prepare(dirs: DataDirs, args: &[String]) -> Result<(), String> {
         ipsw: option(args, "--ipsw").map(|p| IpswSource::File(PathBuf::from(p))).unwrap_or(IpswSource::Download),
         bootrom: option(args, "--rom").map(PathBuf::from),
         name: option(args, "--name"),
+        jailbreak: args.iter().any(|a| a == "--jailbreak"),
     };
     let mut model = lighttouch_model::Model::new(dirs, Resources::locate(), std::sync::Arc::new(|| {}));
     lighttouch_model::prepare::availability(&model.resources)?;

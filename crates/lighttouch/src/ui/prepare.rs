@@ -26,6 +26,8 @@ pub struct PrepareState {
     pub ipsw_file: Option<PathBuf>,
     pub bootrom: Option<PathBuf>,
     pub name: String,
+    /// Prepare it jailbroken; off unless chosen, and only sent for a version that offers it.
+    pub jailbreak: bool,
     pub error: Option<String>,
     /// When the running preparation started (for the elapsed time).
     pub started: Option<Instant>,
@@ -43,6 +45,7 @@ impl PrepareState {
         };
         self.bootrom = request.bootrom.filter(|p| p.is_file());
         self.name = request.name.unwrap_or_default();
+        self.jailbreak = request.jailbreak;
         let download = if self.ipsw_file.is_none() { "; its download picks up where it left off" } else { "" };
         self.error = Some(format!("LightTouch closed before this preparation finished. Prepare it again{download}."));
         self.step = Step::Files;
@@ -341,6 +344,26 @@ fn files_step(app: &mut App, ui: &mut Ui) {
         }),
     );
 
+    // Jailbreak: afc2 and Cydia from the bootstrap firmwarekit downloads; 1.x has no afc2 to serve, so no card.
+    if firmware.offers_jailbreak() {
+        let jailbreak = app.prepare.jailbreak;
+        prep_card(
+            ui,
+            &p,
+            icons::LOCK_OPEN,
+            "Jailbreak",
+            &format!(
+                "Optional; adds {} (the whole file system over USB). Cydia's bootstrap is downloaded from GitHub \
+                 when preparing starts.",
+                firmware.jailbreak_summary()
+            ),
+            jailbreak,
+            Some(&mut |ui: &mut Ui| {
+                ui.add_enabled_ui(!busy, |ui| widgets::switch(ui, &p, &mut app.prepare.jailbreak));
+            }),
+        );
+    }
+
     if let Some(error) = &app.prepare.error {
         ui.add_space(8.0);
         ui.label(RichText::new(error).color(p.error));
@@ -369,6 +392,7 @@ fn files_step(app: &mut App, ui: &mut Ui) {
             ipsw: app.prepare.ipsw_file.clone().map(IpswSource::File).unwrap_or(IpswSource::Download),
             bootrom: app.prepare.bootrom.clone(),
             name: Some(app.prepare.name.clone()).filter(|n| !n.trim().is_empty()),
+            jailbreak: app.prepare.jailbreak && firmware.offers_jailbreak(),
         });
         app.prepare.started = Some(Instant::now());
         app.prepare.step = Step::Progress;

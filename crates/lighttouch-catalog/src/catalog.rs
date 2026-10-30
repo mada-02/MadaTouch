@@ -143,6 +143,22 @@ impl Firmware {
         short_product_name(&self.product_type)
     }
 
+    /// Whether preparation can jailbreak it (firmwarekit's `--jailbreak`): from iPhone OS 2.0 on, since 1.x's afcd
+    /// serves no path through afc2 and firmwarekit refuses the option there.
+    pub fn offers_jailbreak(&self) -> bool {
+        self.major() >= 2
+    }
+
+    /// What the jailbreak adds on this version: Substrate only from iOS 3 to 6, as Legacy iOS Kit's bootstrap has it
+    /// (7.x keeps its root read-only, so Substrate's packages can't install at boot).
+    pub fn jailbreak_summary(&self) -> &'static str {
+        if (3..=6).contains(&self.major()) { "Cydia, Substrate and afc2" } else { "Cydia and afc2" }
+    }
+
+    fn major(&self) -> u32 {
+        self.version.split('.').next().and_then(|major| major.parse().ok()).unwrap_or(0)
+    }
+
     /// "Released March 2010".
     pub fn released_label(&self) -> String {
         const MONTHS: [&str; 12] = [
@@ -368,5 +384,17 @@ mod tests {
         assert_eq!(default_device_name("n72ap", "7E18", ["iPod touch 2G 3.1.3"]), "iPod touch 2G 3.1.3 (2)");
         assert_eq!(device_subtitle("zz", "1A1"), "zz · 1A1");
         assert_eq!(compare_versions("4.2.1", "4.2"), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn jailbreak_is_offered_from_iphone_os_2() {
+        let catalog = Catalog::get();
+        for (id, offered) in
+            [("m68ap-1A543a", false), ("n45ap-4B1", false), ("n72ap-5F138", true), ("n90ap-8C148", true)]
+        {
+            assert_eq!(catalog.find(id).unwrap().offers_jailbreak(), offered, "{id}");
+        }
+        assert_eq!(catalog.find("n72ap-7E18").unwrap().jailbreak_summary(), "Cydia, Substrate and afc2");
+        assert_eq!(catalog.find("n72ap-5F138").unwrap().jailbreak_summary(), "Cydia and afc2");
     }
 }
