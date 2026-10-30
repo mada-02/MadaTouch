@@ -26,8 +26,9 @@ std::string archive_url(const std::string &target, const std::string &date);
 std::string archive_redirect(const std::string &current, const std::string &location,
                              const std::string &date);
 
-// One connection serves one HTTP request (or one CONNECT and its HTTPS request).
-// Count ingress before reading headers so a stalled guest is visible immediately.
+// Counts requests: a connection's first (or a CONNECT and its first HTTPS request), then
+// each further request on a kept-alive connection as its own. Count ingress before
+// reading headers so a stalled guest is visible immediately.
 struct Activity {
     uint64_t connections = 0, active = 0, completed = 0, failed = 0;
     std::string last_result;

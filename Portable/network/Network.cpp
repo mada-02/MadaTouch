@@ -17,6 +17,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -116,6 +117,8 @@ struct Connection {
     explicit Connection(Socket socket, bool own = true) : fd(socket), owner(own) {}
     ~Connection() { if (tls) { if (SSL_is_init_finished(tls)) SSL_shutdown(tls); SSL_free(tls); } if (owner && fd != invalid_socket) close_socket(fd); }
     int read(char *out, int length) { return tls ? SSL_read(tls, out, length) : recv(fd, out, length, 0); }
+    // Whether another message has begun arriving, without taking any of it (false at close or the read timeout).
+    bool waiting() { char c; return (tls ? SSL_peek(tls, &c, 1) : int(recv(fd, &c, 1, MSG_PEEK))) > 0; }
     void write(const std::string &bytes) {
         size_t offset = 0;
         while (offset < bytes.size()) {
@@ -182,26 +185,36 @@ Headers headers(Connection &c, std::vector<std::string> *cookies = nullptr) {
     require(!(out.count("content-length") && out.count("transfer-encoding")), 400, "Ambiguous HTTP framing");
     return out;
 }
-std::string body(Connection &c, const Headers &h, bool until_close, size_t limit) {
+// A message body, handed to `out` piece by piece as it arrives.
+template <class Out> void body_to(Connection &c, const Headers &h, bool until_close, size_t limit, Out &&out) {
     auto transfer = h.find("transfer-encoding"), length = h.find("content-length");
+    std::array<char, 16384> chunk{};
+    size_t total = 0;
+    auto copy = [&](size_t size) {
+        while (size) {
+            int n = c.read(chunk.data(), int(std::min(size, chunk.size())));
+            require(n > 0, 502, "Incomplete response body"); out(chunk.data(), size_t(n)); size -= n;
+        }
+    };
     if (transfer != h.end()) {
         require(lower(transfer->second) == "chunked", 501, "Unsupported transfer encoding");
-        std::string out;
         for (;;) {
             auto line = c.line(1024); auto semi = line.find(';');
-            size_t size = number(line.substr(0, semi), limit - out.size(), 16);
-            if (!size) { (void)headers(c); return out; }
-            out += c.exact(size);
+            size_t size = number(line.substr(0, semi), limit - total, 16);
+            if (!size) { (void)headers(c); return; }
+            total += size; copy(size);
             require(c.exact(2) == "\r\n", 400, "Invalid chunk framing");
         }
     }
-    if (length != h.end()) return c.exact(number(length->second, limit));
-    std::string out;
+    if (length != h.end()) { copy(number(length->second, limit)); return; }
     if (until_close) {
-        std::array<char, 16384> chunk{};
         for (;;) { int n = c.read(chunk.data(), chunk.size()); if (!n) break; require(n > 0, 502, "Upstream connection failed");
-            require(out.size() + n <= limit, 413, "Response exceeds size limit"); out.append(chunk.data(), n); }
+            require(total + n <= limit, 413, "Response exceeds size limit"); total += n; out(chunk.data(), size_t(n)); }
     }
+}
+std::string body(Connection &c, const Headers &h, bool until_close, size_t limit) {
+    std::string out;
+    body_to(c, h, until_close, limit, [&](const char *bytes, size_t size) { out.append(bytes, size); });
     return out;
 }
 std::string authority(const Address &a) {
@@ -261,13 +274,68 @@ bool hop(const std::string &name) {
     static const std::set<std::string> names{"connection", "proxy-connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate", "content-length"};
     return names.count(name);
 }
-std::string response(const Reply &r, bool head = false) {
-    std::string out = "HTTP/1.1 " + std::to_string(r.status) + " Response\r\nConnection: close\r\n";
+// The status line and headers for the guest, without the body's framing or the blank line.
+std::string head_block(const Reply &r, bool keep) {
+    std::string out = "HTTP/1.1 " + std::to_string(r.status) + " Response\r\nConnection: " + (keep ? "keep-alive" : "close") + "\r\n";
     for (const auto &h : r.headers) if (!hop(h.first) && h.first != "strict-transport-security" && h.first != "alt-svc") out += h.first + ": " + h.second + "\r\n";
     for (const auto &cookie : r.cookies) out += "Set-Cookie: " + cookie + "\r\n";
+    return out;
+}
+std::string response(const Reply &r, bool head = false, bool keep = false) {
+    std::string out = head_block(r, keep);
     if (!head) out += "Content-Length: " + std::to_string(r.body.size()) + "\r\n";
     return out + "\r\n" + (head ? "" : r.body);
 }
+// Whether the guest asked to send another request on this connection. Old clients name it in Proxy-Connection.
+bool persistent(const std::string &version, const Headers &h) {
+    auto names = [&](const char *header, const char *token) {
+        auto value = h.find(header); if (value == h.end()) return false;
+        std::istringstream words(lower(value->second)); std::string word;
+        while (std::getline(words, word, ',')) if (trim(word) == token) return true;
+        return false;
+    };
+    if (names("connection", "close") || names("proxy-connection", "close")) return false;
+    return version == "HTTP/1.1" || names("connection", "keep-alive") || names("proxy-connection", "keep-alive");
+}
+// Passes a Direct response on to the guest as it arrives, rather than after the whole body. Up to `hold` bytes are
+// held back first, so a small reply still goes out whole with its length and an upstream failure in it still becomes
+// an error page; past that the guest gets the origin's Content-Length, or a chunked body when there was none.
+struct Relay {
+    static constexpr size_t hold = 64 << 10;
+    Connection &guest;
+    bool head_only, keep, chunked_ok;
+    Reply reply{};
+    long long length = -1;
+    std::string held{};
+    bool started = false, chunked = false;
+    void begin(const Reply &r, long long size) { reply = r; length = size; }
+    void data(const char *bytes, size_t size) {
+        if (started) { send(bytes, size); return; }
+        held.append(bytes, size);
+        if (held.size() > hold) start();
+    }
+    void start() {
+        started = true;
+        std::string framing;
+        if (length >= 0) framing = "Content-Length: " + std::to_string(length) + "\r\n";
+        else if (chunked_ok) { chunked = true; framing = "Transfer-Encoding: chunked\r\n"; }
+        else keep = false; // An HTTP/1.0 guest without a length reads to the close.
+        guest.write(head_block(reply, keep) + framing + "\r\n");
+        std::string first; first.swap(held); send(first.data(), first.size());
+    }
+    void send(const char *bytes, size_t size) {
+        if (!size) return;
+        if (!chunked) { guest.write(std::string(bytes, size)); return; }
+        std::ostringstream hex; hex << std::hex << size;
+        guest.write(hex.str() + "\r\n" + std::string(bytes, size) + "\r\n");
+    }
+    // Completes the response; returns whether the guest connection can carry another request.
+    bool end(Reply whole) {
+        if (!started) { whole.body.swap(held); guest.write(response(whole, head_only, keep)); }
+        else if (chunked) guest.write("0\r\n\r\n");
+        return keep;
+    }
+};
 using Key = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
 using Cert = std::unique_ptr<X509, decltype(&X509_free)>;
 Key new_key() {
@@ -408,6 +476,29 @@ struct Proxy::State {
     struct Cached { std::string target, date; Reply reply; };
     std::list<Cached> cache;
     size_t cache_bytes = 0;
+    // The guest-facing TLS server for each site: its leaf certificate, and the session cache that lets the guest
+    // resume rather than repeat the RSA key exchange, which old iOS computes on the emulated CPU, on every connection.
+    struct GuestTls { std::shared_ptr<SSL_CTX> context; std::chrono::steady_clock::time_point made; };
+    std::mutex guest_tls_mutex;
+    std::map<std::string, GuestTls> guest_tls;
+    std::shared_ptr<SSL_CTX> guest_context(const std::string &host) {
+        std::lock_guard<std::mutex> lock(guest_tls_mutex);
+        auto now = std::chrono::steady_clock::now();
+        auto found = guest_tls.find(host);
+        // Leaves last 30 days; a day keeps a long session well inside that.
+        if (found != guest_tls.end() && now - found->second.made < 24h) return found->second.context;
+        Cert leaf=make_cert(leaf_key.get(),key.get(),ca.get(),host);
+        std::shared_ptr<SSL_CTX> ctx(SSL_CTX_new(TLS_server_method()),SSL_CTX_free); require(bool(ctx),503,"Guest TLS initialization failed");
+        // Only the guest-facing bridge permits historical protocols and ciphers.
+        SSL_CTX_set_security_level(ctx.get(),0); SSL_CTX_set_min_proto_version(ctx.get(),TLS1_VERSION);
+        SSL_CTX_set_cipher_list(ctx.get(),"DEFAULT:@SECLEVEL=0");
+        static const unsigned char id[]="lt-guest";
+        require(SSL_CTX_use_certificate(ctx.get(),leaf.get()) && SSL_CTX_use_PrivateKey(ctx.get(),leaf_key.get()) &&
+                SSL_CTX_set_session_id_context(ctx.get(),id,sizeof(id)-1),503,"Guest TLS identity failed");
+        if (guest_tls.size() >= 256) guest_tls.clear();
+        guest_tls[host] = {ctx, now};
+        return ctx;
+    }
     void begin() { std::lock_guard<std::mutex> lock(mutex); ++activity.connections; ++activity.active; }
     void finish(const std::string &result, bool error) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -428,8 +519,9 @@ struct Proxy::State {
         return origin;
     }
     // One request and its response on `origin`; `answered` once a status line arrived, `reusable` when the
-    // connection can carry another (keep-alive asked and granted, the body framed).
-    Reply exchange(Connection &origin, const Address &address, const std::string &method, const Headers &request_headers, const std::string &upload, bool keep, bool &answered, bool &reusable) {
+    // connection can carry another (keep-alive asked and granted, the body framed). With a `relay` the body goes
+    // to it as it arrives and the reply comes back without one.
+    Reply exchange(Connection &origin, const Address &address, const std::string &method, const Headers &request_headers, const std::string &upload, bool keep, bool &answered, bool &reusable, Relay *relay) {
         std::string wire = method + " " + address.path + " HTTP/1.1\r\nHost: " + authority(address) + (keep ? "\r\nConnection: keep-alive" : "\r\nConnection: close") + "\r\nAccept-Encoding: identity\r\n";
         std::set<std::string> connection_names;
         auto named = request_headers.find("connection");
@@ -445,35 +537,60 @@ struct Proxy::State {
         }
         require(reply.status>=200,502,"Too many interim responses");
         const bool bodyless = method=="HEAD" || reply.status==204 || reply.status==304;
-        if (!bodyless) reply.body=body(origin,reply.headers,true,body_limit);
-        reusable = keep && version=="HTTP/1.1" && (bodyless || reply.headers.count("content-length") || reply.headers.count("transfer-encoding")) &&
-                   !(reply.headers.count("connection") && lower(reply.headers["connection"]).find("close")!=std::string::npos);
+        const Headers framing = reply.headers;
+        reusable = keep && version=="HTTP/1.1" && (bodyless || framing.count("content-length") || framing.count("transfer-encoding")) &&
+                   !(framing.count("connection") && lower(framing.at("connection")).find("close")!=std::string::npos);
         // Remove headers explicitly named by Connection, too.
         if (reply.headers.count("connection")) { std::istringstream words(lower(reply.headers["connection"])); std::string token; while (std::getline(words,token,',')) { token=trim(token); if (token=="set-cookie") reply.cookies.clear(); if (token!="connection") reply.headers.erase(token); } }
+        if (!relay) { if (!bodyless) reply.body=body(origin,framing,true,body_limit); return reply; }
+        long long length = -1;
+        if (!bodyless && framing.count("content-length") && !framing.count("transfer-encoding")) length = (long long)number(framing.at("content-length"),body_limit);
+        relay->begin(reply,length);
+        if (!bodyless) body_to(origin,framing,true,body_limit,[&](const char *bytes, size_t size) { relay->data(bytes,size); });
         return reply;
     }
-    // Idle connections to the Internet Archive, kept like a browser keeps its own: a new TCP and TLS handshake for
-    // every request and redirect was most of each resource's time.
+    // Idle connections to the sites the guest uses, kept like a browser keeps its own: a new DNS lookup, TCP and TLS
+    // handshake for every request and redirect was most of each resource's time. Keyed by origin and by whether the
+    // connection was made with local-network access, so turning that off never reuses one that had it.
+    struct Idle { std::string key; std::unique_ptr<Connection> connection; std::chrono::steady_clock::time_point since; };
     std::mutex pool_mutex;
-    std::vector<std::unique_ptr<Connection>> archive_pool;
-    Reply fetch(const Configuration &config, const std::string &url, const std::string &method, const Headers &request_headers = {}, const std::string &upload = "", bool keep = false) {
+    std::list<Idle> pool;
+    std::unique_ptr<Connection> take(const std::string &key) {
+        std::unique_ptr<Connection> found;
+        std::vector<std::unique_ptr<Connection>> stale;
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex);
+            auto now = std::chrono::steady_clock::now();
+            for (auto it = pool.begin(); it != pool.end();) {
+                if (now - it->since > 30s) { stale.push_back(std::move(it->connection)); it = pool.erase(it); continue; }
+                if (!found && it->key == key) { found = std::move(it->connection); it = pool.erase(it); continue; }
+                ++it;
+            }
+        }
+        return found; // `stale` closes outside the lock.
+    }
+    void give(const std::string &key, std::unique_ptr<Connection> connection) {
+        std::unique_ptr<Connection> oldest;
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        if (pool.size() >= 32) { oldest = std::move(pool.front().connection); pool.pop_front(); }
+        pool.push_front({key, std::move(connection), std::chrono::steady_clock::now()});
+    }
+    Reply fetch(const Configuration &config, const std::string &url, const std::string &method, const Headers &request_headers = {}, const std::string &upload = "", Relay *relay = nullptr) {
         Address address = Address::parse(url);
-        keep = keep && address.scheme == "https" && lower(address.host) == "web.archive.org" && address.port == 443;
+        const bool local = config.local_network && config.mode == Mode::direct;
+        const std::string key = address.scheme + "://" + authority(address) + (local ? " lan" : "");
+        // A kept connection the server has quietly closed is only found by using it, and then the request may or
+        // may not have reached it: only requests that are safe to send twice go on one.
+        const bool idempotent = method == "GET" || method == "HEAD" || method == "OPTIONS";
         for (int attempt = 0;; attempt++) {
             std::unique_ptr<Connection> origin;
-            if (keep && attempt == 0) {
-                std::lock_guard<std::mutex> lock(pool_mutex);
-                if (!archive_pool.empty()) { origin = std::move(archive_pool.back()); archive_pool.pop_back(); }
-            }
+            if (idempotent && attempt == 0) origin = take(key);
             const bool pooled = bool(origin);
             if (!origin) origin = open(config, address);
             bool answered = false, reusable = false;
             try {
-                Reply reply = exchange(*origin, address, method, request_headers, upload, keep, answered, reusable);
-                if (reusable) {
-                    std::lock_guard<std::mutex> lock(pool_mutex);
-                    if (archive_pool.size() < 32) archive_pool.push_back(std::move(origin));
-                }
+                Reply reply = exchange(*origin, address, method, request_headers, upload, true, answered, reusable, relay);
+                if (reusable) give(key, std::move(origin));
                 return reply;
             } catch (const std::exception &) {
                 // A kept connection the server has since closed fails before any answer: once more on a new one.
@@ -502,7 +619,7 @@ struct Proxy::State {
             }
             Reply r;
             try {
-                r=fetch(config,url,method,{{"user-agent","LightTouch/1.0 (archive replay)"}},"",true);
+                r=fetch(config,url,method,{{"user-agent","LightTouch/1.0 (archive replay)"}});
             } catch (const Error &error) {
                 // A refused connection is the Archive limiting this address for a while: pause rather than retry
                 // every resource, which would only keep it refusing.
@@ -671,7 +788,8 @@ void Proxy::listen(const std::string &path) {
             }
             timeout(peer,30);
             std::unique_lock<std::mutex> lock(state->mutex);
-            if (state->stopping || state->active.size()>=16) { close_socket(peer); continue; }
+            // Safari keeps a few connections open to each site it has used, so leave room for several sites.
+            if (state->stopping || state->active.size()>=64) { close_socket(peer); continue; }
             state->active.insert(peer); lock.unlock();
             std::thread([this,peer] {
                 try { serve(peer); } catch (...) {}
@@ -688,63 +806,89 @@ void Proxy::serve(std::intptr_t socket) {
 #endif
     Connection guest(Socket(socket),false);
     state->begin();
-    try {
-        require(state->configuration().mode!=Mode::off,503,"Networking is off");
-        std::string line=guest.line(); std::istringstream first(line); std::string method,target,version,extra;
-        first>>method>>target>>version>>extra;
-        require((version=="HTTP/1.0" || version=="HTTP/1.1") && extra.empty(),400,"Invalid HTTP request");
-        auto h=headers(guest);
-        if (method=="CONNECT") {
-            require(!h.count("transfer-encoding") && (!h.count("content-length") || h["content-length"]=="0"),400,"CONNECT cannot have a body");
-            auto address=Address::parse("https://"+target+"/");
-            require(address.port==443,403,"HTTPS bridge supports port 443");
-            Cert leaf=make_cert(state->leaf_key.get(),state->key.get(),state->ca.get(),address.host);
-            SSL_CTX *ctx=SSL_CTX_new(TLS_server_method()); require(ctx,503,"Guest TLS initialization failed");
-            // Only the guest-facing bridge permits historical protocols and ciphers.
-            SSL_CTX_set_security_level(ctx,0); SSL_CTX_set_min_proto_version(ctx,TLS1_VERSION);
-            SSL_CTX_set_cipher_list(ctx,"DEFAULT:@SECLEVEL=0");
-            int ok=SSL_CTX_use_certificate(ctx,leaf.get()) && SSL_CTX_use_PrivateKey(ctx,state->leaf_key.get());
-            guest.tls=SSL_new(ctx); SSL_CTX_free(ctx); require(ok && guest.tls,503,"Guest TLS identity failed");
-            // CONNECT acknowledgment must precede TLS bytes.
-            SSL *tls=guest.tls; guest.tls=nullptr; guest.write("HTTP/1.1 200 Connection established\r\n\r\n"); guest.tls=tls;
-            SSL_set_fd(guest.tls,int(guest.fd));
-            if (SSL_accept(guest.tls)!=1) {
-                char reason[256]; ERR_error_string_n(ERR_get_error(),reason,sizeof(reason));
-                throw Error(502,std::string("Guest TLS handshake failed: ")+reason);
-            }
-            line=guest.line(); std::istringstream secure(line);
-            method.clear(); target.clear(); version.clear(); extra.clear(); secure>>method>>target>>version>>extra;
+    // A guest connection carries requests one after another for as long as both sides keep it open, as browsers
+    // expect: reconnecting cost a TCP setup each time and, inside a CONNECT tunnel, a TLS handshake that old iOS
+    // computes on the emulated CPU. Each request after the first counts as a new connection in Activity.
+    std::optional<Address> tunnel;
+    for (bool first=true, open=true; open; first=false) {
+        if (!first) {
+            // An idle connection closes quietly: Safari opens another when it needs one.
+            timeout(guest.fd,15);
+            if (!guest.waiting()) break;
+            timeout(guest.fd,30);
+            state->begin();
+        }
+        std::optional<Relay> relay;
+        try {
+            require(state->configuration().mode!=Mode::off,503,"Networking is off");
+            std::string line=guest.line(); std::istringstream request(line); std::string method,target,version,extra;
+            request>>method>>target>>version>>extra;
             require((version=="HTTP/1.0" || version=="HTTP/1.1") && extra.empty(),400,"Invalid HTTP request");
-            h=headers(guest);
-            require(target.size() && target[0]=='/' && !starts(target,"//"),400,"Invalid HTTPS request target");
-            target="https://"+authority(address)+target;
+            auto h=headers(guest);
+            if (method=="CONNECT") {
+                require(!tunnel,400,"CONNECT inside an HTTPS tunnel");
+                require(!h.count("transfer-encoding") && (!h.count("content-length") || h["content-length"]=="0"),400,"CONNECT cannot have a body");
+                auto address=Address::parse("https://"+target+"/");
+                require(address.port==443,403,"HTTPS bridge supports port 443");
+                auto ctx=state->guest_context(address.host);
+                SSL *tls=SSL_new(ctx.get()); require(tls,503,"Guest TLS identity failed");
+                // CONNECT acknowledgment must precede TLS bytes.
+                try { guest.write("HTTP/1.1 200 Connection established\r\n\r\n"); } catch (...) { SSL_free(tls); throw; }
+                guest.tls=tls;
+                SSL_set_fd(guest.tls,int(guest.fd));
+                if (SSL_accept(guest.tls)!=1) {
+                    char reason[256]; ERR_error_string_n(ERR_get_error(),reason,sizeof(reason));
+                    throw Error(502,std::string("Guest TLS handshake failed: ")+reason);
+                }
+                tunnel=address;
+                line=guest.line(); std::istringstream secure(line);
+                method.clear(); target.clear(); version.clear(); extra.clear(); secure>>method>>target>>version>>extra;
+                require((version=="HTTP/1.0" || version=="HTTP/1.1") && extra.empty(),400,"Invalid HTTP request");
+                h=headers(guest);
+            }
+            if (tunnel) {
+                require(target.size() && target[0]=='/' && !starts(target,"//"),400,"Invalid HTTPS request target");
+                target="https://"+authority(*tunnel)+target;
+            }
+            require(method=="GET" || method=="HEAD" || method=="POST" || method=="PUT" || method=="DELETE" || method=="OPTIONS" || method=="PATCH",405,"Unsupported HTTP method");
+            Address address=Address::parse(target);
+            const auto config=state->configuration();
+            require(config.mode!=Mode::off,503,"Networking is off");
+            require(!h.count("expect"),417,"Expect requests are unsupported");
+            if (config.mode==Mode::archive) require(method=="GET" || method=="HEAD",405,"Wayback browsing supports GET and HEAD; forms need Direct internet");
+            auto upload=body(guest,h,false,upload_limit);
+            bool keep=persistent(version,h);
+            Reply reply;
+            if (config.mode==Mode::archive) {
+                reply=state->archived(config,address.url(),method);
+                // The guest URL stays the same when the date changes. Keep the dated
+                // cache in the host, where its key includes the selected date.
+                reply.headers["cache-control"]="no-store";
+                guest.write(response(reply,method=="HEAD",keep));
+            } else {
+                relay.emplace(Relay{guest,method=="HEAD",keep,version=="HTTP/1.1"});
+                reply=state->fetch(config,address.url(),method,h,upload,&*relay);
+                keep=relay->end(reply);
+            }
+            std::string result = "HTTP " + std::to_string(reply.status);
+            if (config.mode==Mode::archive) {
+                // Which copy came back: the Archive serves the capture nearest the chosen day when it has none that day.
+                const std::string chosen = long_day(config.archive_date), served = reply.capture.empty() ? "" : long_day(reply.capture);
+                const std::string error = reply.status>=400 ? " (HTTP " + std::to_string(reply.status) + ")" : "";
+                if (reply.status==429 || reply.status==503) result = "Internet Archive is busy. Try reloading later.";
+                else if (served.empty()) { if (reply.status==404) result = "No archived capture is available for this page"; }
+                else if (reply.capture==config.archive_date) result = (error.empty() ? "Loaded the copy from " : "The copy from ") + served + (error.empty() ? "" : " is an error page" + error);
+                else result = "No copy from " + chosen + (error.empty() ? "; loaded the nearest, from " + served : "; the nearest, from " + served + ", is an error page" + error);
+            }
+            state->finish(result, reply.status>=400);
+            open=keep;
+        } catch (const std::exception &error) {
+            // Once part of a response has gone out, closing is the only way left to tell the guest it failed.
+            if (!relay || !relay->started)
+                try { auto typed=dynamic_cast<const Error *>(&error); guest.write(response({typed?typed->status:502,{{"content-type","text/plain; charset=utf-8"}},std::string(error.what())+"\n"})); } catch (...) {}
+            state->finish(error.what(), true);
+            open=false;
         }
-        require(method=="GET" || method=="HEAD" || method=="POST" || method=="PUT" || method=="DELETE" || method=="OPTIONS" || method=="PATCH",405,"Unsupported HTTP method");
-        Address address=Address::parse(target);
-        const auto config=state->configuration();
-        require(config.mode!=Mode::off,503,"Networking is off");
-        require(!h.count("expect"),417,"Expect requests are unsupported");
-        if (config.mode==Mode::archive) require(method=="GET" || method=="HEAD",405,"Wayback browsing supports GET and HEAD; forms need Direct internet");
-        auto upload=body(guest,h,false,upload_limit);
-        Reply reply=config.mode==Mode::archive ? state->archived(config,address.url(),method) : state->fetch(config,address.url(),method,h,upload);
-        // The guest URL stays the same when the date changes. Keep the dated
-        // cache in the host, where its key includes the selected date.
-        if (config.mode==Mode::archive) reply.headers["cache-control"]="no-store";
-        guest.write(response(reply,method=="HEAD"));
-        std::string result = "HTTP " + std::to_string(reply.status);
-        if (config.mode==Mode::archive) {
-            // Which copy came back: the Archive serves the capture nearest the chosen day when it has none that day.
-            const std::string chosen = long_day(config.archive_date), served = reply.capture.empty() ? "" : long_day(reply.capture);
-            const std::string error = reply.status>=400 ? " (HTTP " + std::to_string(reply.status) + ")" : "";
-            if (reply.status==429 || reply.status==503) result = "Internet Archive is busy. Try reloading later.";
-            else if (served.empty()) { if (reply.status==404) result = "No archived capture is available for this page"; }
-            else if (reply.capture==config.archive_date) result = (error.empty() ? "Loaded the copy from " : "The copy from ") + served + (error.empty() ? "" : " is an error page" + error);
-            else result = "No copy from " + chosen + (error.empty() ? "; loaded the nearest, from " + served : "; the nearest, from " + served + ", is an error page" + error);
-        }
-        state->finish(result, reply.status>=400);
-    } catch (const std::exception &error) {
-        try { auto typed=dynamic_cast<const Error *>(&error); guest.write(response({typed?typed->status:502,{{"content-type","text/plain; charset=utf-8"}},std::string(error.what())+"\n"})); } catch (...) {}
-        state->finish(error.what(), true);
     }
 }
 } // namespace lt::network
