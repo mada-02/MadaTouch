@@ -37,6 +37,7 @@ static std::string request(Proxy &proxy, const std::string &path, const std::str
     std::thread worker([&]{proxy.serve(pair[1]);close(pair[1]);});
     Connection guest(pair[0]);
     guest.write(method+" http://origin.test/"+path+" HTTP/1.1\r\nHost: origin.test\r\n\r\n");
+    shutdown(pair[0],SHUT_WR); // The proxy keeps a connection open for another request until the guest ends it.
     std::string out;char block[4096];int count;
     while((count=guest.read(block,sizeof(block)))>0) out.append(block,count);
     worker.join();

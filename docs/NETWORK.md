@@ -31,6 +31,18 @@ guest TLS bridge, dated archive routing, redirect handling, a bounded memory cac
 one archive fetch per second, and Retry-After cooldowns. Guest credentials and
 cookies are excluded from archive requests. Direct browsing preserves cookies.
 Bodies, headers, uploads, redirects and concurrent connections are bounded.
+
+Connections are kept as a browser keeps them. The guest's connection to the proxy
+(and its CONNECT tunnel) carries one request after another until either side
+closes it or it idles for 15 s; each later request counts as its own connection
+in Activity. Connections to sites, the Archive included, are pooled by origin
+(and LAN access) for 30 s and reused for GET, HEAD and OPTIONS. Each site's
+guest-facing TLS certificate and session cache are kept for the session, so a
+new tunnel resumes the guest's TLS session instead of a full RSA handshake on the
+emulated CPU. Direct responses go on to the guest as they arrive: up to 64 KiB is
+held so a small reply still goes whole with its length (and a failure in it
+becomes an error page); past that the guest gets the origin's Content-Length, or
+a chunked body. Archive responses stay whole, for the dated cache.
 `Proxy::configure` publishes a short-locked configuration snapshot independently
 of archive fetches. The bounded host cache keys captures by URL and selected date,
 including responses completing after a date change. Archive responses disable

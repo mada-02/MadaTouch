@@ -22,7 +22,10 @@ using namespace lt::network;
 extern "C" int __wrap_link(const char *, const char *) { errno=EPERM;return -1; }
 extern "C" int __wrap_linkat(int, const char *, int, const char *, int) { errno=EPERM;return -1; }
 #endif
-std::string exchange(Proxy &proxy, const std::string &wire, bool tls = false) {
+// Sends `wire`, then closes the sending side so the proxy's kept-alive connection ends after its responses.
+// With `session`, a TLS exchange offers that session and leaves the new one there; `resumed` says if it was taken.
+static bool resumed=false;
+std::string exchange(Proxy &proxy, const std::string &wire, bool tls = false, SSL_SESSION **session = nullptr) {
     int sockets[2]; assert(!socketpair(AF_UNIX,SOCK_STREAM,0,sockets));
     std::thread worker([&]{proxy.serve(sockets[1]);close(sockets[1]);});
     SSL_CTX *context=nullptr; SSL *ssl=nullptr;
@@ -37,12 +40,14 @@ std::string exchange(Proxy &proxy, const std::string &wire, bool tls = false) {
         SSL_CTX_set_verify(context,SSL_VERIFY_PEER,nullptr);
         auto der=proxy.certificate();auto p=reinterpret_cast<const unsigned char *>(der.data());
         X509 *ca=d2i_X509(nullptr,&p,der.size());assert(ca);assert(X509_STORE_add_cert(SSL_CTX_get_cert_store(context),ca)==1);X509_free(ca);
-        ssl=SSL_new(context);SSL_set_fd(ssl,sockets[0]);SSL_set1_host(ssl,"example.com");
+        ssl=SSL_new(context);SSL_set_fd(ssl,sockets[0]);SSL_set1_host(ssl,"example.com");if(session && *session)SSL_set_session(ssl,*session);
         int result=SSL_connect(ssl);
         if(result!=1){ERR_print_errors_fp(stderr);std::cerr<<proxy.status()<<"\n";}
         assert(result==1);assert(SSL_get_verify_result(ssl)==X509_V_OK);
-        assert(SSL_write(ssl,wire.data(),wire.size())==int(wire.size()));
-    } else assert(send(sockets[0],wire.data(),wire.size(),0)==ssize_t(wire.size()));
+        resumed=SSL_session_reused(ssl);
+        if(session){if(*session)SSL_SESSION_free(*session);*session=SSL_get1_session(ssl);}
+        assert(SSL_write(ssl,wire.data(),wire.size())==int(wire.size()));SSL_shutdown(ssl);
+    } else {assert(send(sockets[0],wire.data(),wire.size(),0)==ssize_t(wire.size()));shutdown(sockets[0],SHUT_WR);}
     std::string response;char block[8192];int size;
     while((size=ssl?SSL_read(ssl,block,sizeof(block)):int(recv(sockets[0],block,sizeof(block),0)))>0)response.append(block,size);
     if(ssl)SSL_free(ssl);if(context)SSL_CTX_free(context);
@@ -161,6 +166,31 @@ int main(int argc,char **argv) {
         assert(activity.completed==unsigned(drop_cookie?2:1) && activity.failed==0 && activity.active==0);
         assert(activity.last_result=="HTTP 200" && !activity.last_result_error);
         }
+        {
+        // One guest connection carries two requests, the origin sees both on one kept-alive connection, and a body
+        // larger than the proxy holds back is passed on as it arrives (chunked, since the origin gave no length).
+        std::string observed;const std::string big(100000,'x');
+        std::thread origin([&]{int peer=accept(listener,nullptr,nullptr);assert(peer>=0);
+            for(int i=0;i<2;i++){std::string request;char c;while(request.find("\r\n\r\n")==std::string::npos){assert(recv(peer,&c,1,0)==1);request+=c;}observed+=request;
+                std::string r=i==0?"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst":"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+                if(i)for(size_t at=0;at<big.size();at+=10000){char size[16];snprintf(size,sizeof(size),"%zx\r\n",std::min<size_t>(10000,big.size()-at));r+=size+big.substr(at,10000)+"\r\n";}
+                if(i)r+="0\r\n\r\n";
+                assert(send(peer,r.data(),r.size(),0)==ssize_t(r.size()));}
+            close(peer);});
+        const auto url="http://"+local_address()+":"+std::to_string(ntohs(a.sin_port));
+        auto before=direct.activity().completed;
+        auto r=exchange(direct,"GET "+url+"/a HTTP/1.1\r\n\r\nGET "+url+"/b HTTP/1.1\r\n\r\n");origin.join();
+        assert(observed.find("GET /a ")!=std::string::npos && observed.find("GET /b ")!=std::string::npos);
+        assert(observed.find("Connection: keep-alive")!=std::string::npos);
+        auto second=r.find("HTTP/1.1 200",1);assert(second!=std::string::npos);
+        auto one=r.substr(0,second),two=r.substr(second);
+        assert(one.find("Connection: keep-alive\r\n")!=std::string::npos && one.find("Content-Length: 5\r\n")!=std::string::npos && one.substr(one.size()-5)=="first");
+        assert(two.find("Transfer-Encoding: chunked\r\n")!=std::string::npos);
+        std::string decoded;size_t at=two.find("\r\n\r\n")+4;
+        for(;;){auto end=two.find("\r\n",at);size_t size=std::stoul(two.substr(at,end-at),nullptr,16);if(!size)break;decoded+=two.substr(end+2,size);at=end+2+size+2;}
+        assert(decoded==big);
+        auto activity=direct.activity();assert(activity.completed==before+2 && activity.failed==0 && activity.active==0);
+        }
         close(listener);
         // Host loopback remains refused even after LAN opt-in.
         assert(exchange(direct,"GET http://127.1/ HTTP/1.1\r\n\r\n").find("403")!=std::string::npos);
@@ -170,11 +200,15 @@ int main(int argc,char **argv) {
         config.mode=Mode::archive;config.archive_date="20090909";Proxy archive(directory+"/archive",config);
         auto r=exchange(archive,"POST /login HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",true);
         assert(r.find("405")!=std::string::npos && r.find("Wayback browsing")!=std::string::npos);
+        // A second tunnel to the same site resumes the guest's TLS session instead of a full handshake.
+        SSL_SESSION *session=nullptr;
+        for(int i=0;i<2;i++){assert(exchange(archive,"POST /login HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",true,&session).find("405")!=std::string::npos);assert(resumed==(i==1));}
+        SSL_SESSION_free(session);
         for (auto line:{"POST /login HTTP/2.0", "POST /login HTTP/1.1 unexpected", "POST /login"}) {
             assert(exchange(archive,std::string(line)+"\r\nHost: example.com\r\n\r\n",true).find("400")!=std::string::npos);
         }
         assert(exchange(archive,"CONNECT example.com:22 HTTP/1.1\r\n\r\n").find("403")!=std::string::npos);
     }
     std::filesystem::remove_all(directory);
-    std::cout<<"PASS: routing, dates, address policy, framing, offline, LAN opt-in, chunked HTTP, credentials, persistent CA, verified TLS 1.0 bridge, archive method isolation\n";
+    std::cout<<"PASS: routing, keep-alive, streaming, TLS resumption, dates, address policy, framing, offline, LAN opt-in, chunked HTTP, credentials, persistent CA, verified TLS 1.0 bridge, archive method isolation\n";
 }
